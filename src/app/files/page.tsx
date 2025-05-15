@@ -1,15 +1,15 @@
-// File: src/app/files/page.tsx
 "use client";
 
 import { useState, useEffect } from "react";
-import { baseURL, getAuthHeader } from "../../../client/api";
-import { signOut } from "next-auth/react";
-// import { useRouter } from "next/navigation";
+import { baseURL } from "../../../client/api";
+import ProtectedPage from "../../../component/protectedWrapper/protectedwrapper";
+import { useAuth } from "../../../component/provider/keycloakprovider";
+import keycloak from "../../../keycloak/client/client";
+// import { producer } from "../../../client/kafkaProducer/kafkaproducer";
 
 interface FileInfo {
   key: string;
   pathStyleUrl: string;
-  virtualHostUrl?: string;
 }
 
 interface Bucket {
@@ -17,13 +17,27 @@ interface Bucket {
   creationDate: string;
 }
 
+interface FileNode {
+  name: string;
+  path: string;
+  isFile: boolean;
+  url?: string;
+  children?: FileNode[];
+}
+
 export default function FileUploader() {
-  // const router = useRouter();
-  const [file, setFile] = useState<File | null>(null);
-  const [files, setFiles] = useState<FileInfo[]>([]);
+  const [file, setFile] = useState<File[] | null>(null);
+  const [tree, setTree] = useState<FileNode[]>([]);
   const [buckets, setBuckets] = useState<Bucket[]>([]);
   const [selectedBucket, setSelectedBucket] = useState<string>("");
   const [message, setMessage] = useState<string>("");
+  const [currentPath, setCurrentPath] = useState<string[]>([]);
+  const [isUploading, setIsUploading] = useState(false);
+  const [previewFile, setPreviewFile] = useState<{
+    url: string;
+    name: string;
+  } | null>(null);
+  const { token } = useAuth();
 
   useEffect(() => {
     fetchBuckets();
@@ -32,13 +46,11 @@ export default function FileUploader() {
   const fetchBuckets = async () => {
     try {
       const res = await fetch(`${baseURL}/fetchbucket`, {
-        method: "GET",
         headers: {
-          ...getAuthHeader(),
+          Authorization: `Bearer ${token}`,
         },
       });
       const data = await res.json();
-      console.log(data);
       if (res.ok) {
         setBuckets(data.data);
         if (data.data.length > 0) {
@@ -47,8 +59,7 @@ export default function FileUploader() {
       } else {
         setMessage("Failed to fetch buckets");
       }
-    } catch (error) {
-      console.error(error);
+    } catch {
       setMessage("Error fetching buckets");
     }
   };
@@ -64,27 +75,306 @@ export default function FileUploader() {
         method: "POST",
         headers: {
           "Content-Type": "application/json",
-          ...getAuthHeader(),
+          Authorization: `Bearer ${token}`,
         },
         body: JSON.stringify({ bucket: selectedBucket }),
       });
+
       const data = await res.json();
       if (res.ok) {
-        setFiles(data);
+        const tree = buildFileTree(data);
+        setTree(tree);
       } else {
         setMessage("Failed to fetch files");
       }
-    } catch (error) {
-      console.log(error);
+    } catch {
       setMessage("Error fetching files");
     }
   };
 
-  const handleFileChange = (e: React.ChangeEvent<HTMLInputElement>) => {
-    if (e.target.files && e.target.files[0]) {
-      setFile(e.target.files[0]);
+  const buildFileTree = (files: FileInfo[]): FileNode[] => {
+    const root: FileNode[] = [];
+
+    for (const file of files) {
+      const parts = file.key.split("/");
+      let current = root;
+
+      parts.forEach((part, index) => {
+        const existing = current.find((node) => node.name === part);
+        if (existing) {
+          if (!existing.children) existing.children = [];
+          current = existing.children;
+        } else {
+          const isFile = index === parts.length - 1;
+          const newNode: FileNode = {
+            name: part,
+            path: parts.slice(0, index + 1).join("/"),
+            isFile,
+            url: isFile ? file.pathStyleUrl : undefined,
+            children: isFile ? undefined : [],
+          };
+          current.push(newNode);
+          if (!isFile) current = newNode.children!;
+        }
+      });
+    }
+
+    return root;
+  };
+
+  const getCurrentFolderContents = (): FileNode[] => {
+    let current = tree;
+    for (const pathPart of currentPath) {
+      const folder = current.find((node) => node.name === pathPart);
+      if (folder && folder.children) {
+        current = folder.children;
+      } else {
+        return [];
+      }
+    }
+    return current;
+  };
+
+  const navigateToFolder = (folderName: string) => {
+    setCurrentPath([...currentPath, folderName]);
+  };
+
+  const navigateUp = () => {
+    setCurrentPath(currentPath.slice(0, -1));
+  };
+
+  const navigateToRoot = () => {
+    setCurrentPath([]);
+  };
+
+  const renderBreadcrumbs = () => (
+    <div className="flex items-center space-x-2 mb-4 text-sm">
+      <button
+        onClick={navigateToRoot}
+        className="text-blue-600 hover:text-blue-800"
+      >
+        Root
+      </button>
+      {currentPath.map((path, index) => (
+        <div key={index} className="flex items-center">
+          <span className="mx-2">/</span>
+          <button
+            onClick={() => setCurrentPath(currentPath.slice(0, index + 1))}
+            className="text-blue-600 hover:text-blue-800"
+          >
+            {path}
+          </button>
+        </div>
+      ))}
+    </div>
+  );
+
+  const getFreshPresignedUrl = async (key: string) => {
+    try {
+      const res = await fetch(`${baseURL}/fetchfile`, {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          Authorization: `Bearer ${token}`,
+        },
+        body: JSON.stringify({ bucket: selectedBucket }),
+      });
+
+      const data = await res.json();
+      if (res.ok) {
+        const file = data.find((f: FileInfo) => f.key === key);
+        if (file) {
+          return file.pathStyleUrl;
+        }
+      }
+      setMessage("Failed to get file URL");
+      return null;
+    } catch {
+      setMessage("Error getting file URL");
+      return null;
     }
   };
+
+  const handleFileClick = async (node: FileNode) => {
+    const url = await getFreshPresignedUrl(node.path);
+    if (url) {
+      setPreviewFile({ url, name: node.name });
+    }
+  };
+
+  const getFileType = (fileName: string) => {
+    const extension = fileName.split(".").pop()?.toLowerCase();
+    if (!extension) return "unknown";
+
+    const imageTypes = ["jpg", "jpeg", "png", "gif", "webp", "svg"];
+    const textTypes = ["txt", "md", "json", "js", "ts", "html", "css", "xml"];
+    const pdfTypes = ["pdf"];
+    const videoTypes = ["mp4", "webm", "ogg"];
+    const audioTypes = ["mp3", "wav", "ogg"];
+
+    if (imageTypes.includes(extension)) return "image";
+    if (textTypes.includes(extension)) return "text";
+    if (pdfTypes.includes(extension)) return "pdf";
+    if (videoTypes.includes(extension)) return "video";
+    if (audioTypes.includes(extension)) return "audio";
+    return "unknown";
+  };
+
+  const renderPreviewContent = () => {
+    if (!previewFile) return null;
+
+    const fileType = getFileType(previewFile.name);
+
+    switch (fileType) {
+      case "image":
+        return (
+          <img
+            src={previewFile.url}
+            alt={previewFile.name}
+            className="max-w-full max-h-[80vh] object-contain"
+          />
+        );
+      case "pdf":
+        return (
+          <iframe
+            src={previewFile.url}
+            className="w-full h-[80vh]"
+            title={previewFile.name}
+          />
+        );
+      case "video":
+        return (
+          <video
+            src={previewFile.url}
+            controls
+            className="max-w-full max-h-[80vh]"
+          />
+        );
+      case "audio":
+        return <audio src={previewFile.url} controls className="w-full" />;
+      case "text":
+        return (
+          <iframe
+            src={previewFile.url}
+            className="w-full h-[80vh]"
+            title={previewFile.name}
+          />
+        );
+      default:
+        return (
+          <div className="text-center p-4">
+            <p className="mb-4">This file type cannot be previewed.</p>
+            <a
+              href={previewFile.url}
+              target="_blank"
+              rel="noopener noreferrer"
+              className="text-blue-600 hover:underline"
+            >
+              Open in new tab
+            </a>
+          </div>
+        );
+    }
+  };
+
+  const renderCurrentFolder = () => {
+    const currentContents = getCurrentFolderContents();
+
+    return (
+      <div className="space-y-2">
+        {currentPath.length > 0 && (
+          <button
+            onClick={navigateUp}
+            className="flex items-center text-blue-600 hover:text-blue-800 mb-4"
+          >
+            <span className="mr-2">←</span> Go Up
+          </button>
+        )}
+
+        {currentContents.map((node) =>
+          node.isFile ? (
+            <div
+              key={node.path}
+              className="flex items-center p-2 hover:bg-gray-50 rounded cursor-pointer"
+              onClick={() => handleFileClick(node)}
+            >
+              <span className="mr-2">📄</span>
+              <span className="text-blue-600 hover:underline break-all">
+                {node.name}
+              </span>
+            </div>
+          ) : (
+            <button
+              key={node.path}
+              onClick={() => navigateToFolder(node.name)}
+              className="flex items-center w-full p-2 hover:bg-gray-50 rounded text-left"
+            >
+              <span className="mr-2">📁</span>
+              <span className="font-medium">{node.name}</span>
+            </button>
+          )
+        )}
+      </div>
+    );
+  };
+
+  const handleFileChange = (e: React.ChangeEvent<HTMLInputElement>) => {
+    console.log(currentPath);
+
+    console.log(e.target.files);
+    if (e.target.files && e.target.files) {
+      setFile(e.target.files ? Array.from(e.target.files) : null);
+    }
+  };
+
+  // const handleUpload = async () => {
+  //   if (!file || !selectedBucket) {
+  //     setMessage("Please select a file and a bucket");
+  //     return;
+  //   }
+
+  //   setIsUploading(true);
+  //   const formData = new FormData();
+  //   formData.append("file", file);
+  //   formData.append("bucket", selectedBucket);
+
+  //   const uploadPath =
+  //     currentPath.length > 0
+  //       ? `${currentPath.join("/")}/${file.name}`
+  //       : file.name;
+  //   formData.append("path", uploadPath);
+
+  //   try {
+  //     await producer.connect();
+
+  //     // await producer.send({topic:"produce_from_frontend",messages:})
+  //     // const res = await fetch(`${baseURL}/upload`, {
+  //     //   method: "POST",
+  //     //   headers: {
+  //     //     Authorization: `Bearer ${token}`,
+  //     //   },
+  //     //   body: formData,
+  //     // });
+
+  //     // const data = await res.json();
+  //     // if (res.ok) {
+  //     //   setMessage("File uploaded successfully");
+  //     //   setFile(null);
+  //     //   // Reset file input
+  //     //   const fileInput = document.querySelector(
+  //     //     'input[type="file"]'
+  //     //   ) as HTMLInputElement;
+  //     //   if (fileInput) fileInput.value = "";
+  //     fetchFiles();
+  //     // } else {
+  //     //   setMessage(data.error || "Failed to upload file");
+  //     // }
+  //   } catch {
+  //     setMessage("Error uploading file");
+  //   } finally {
+  //     setIsUploading(false);
+  //   }
+  // };
 
   const handleUpload = async () => {
     if (!file || !selectedBucket) {
@@ -92,211 +382,191 @@ export default function FileUploader() {
       return;
     }
 
+    setIsUploading(true);
     const formData = new FormData();
-    formData.append("file", file);
+    file.forEach((f) => {
+      formData.append("file", f);
+      formData.append("fileName", f.name);
+    });
+
+    const finalPath = currentPath.join("/");
+    console.log(finalPath);
+    formData.append("path", finalPath);
     formData.append("bucket", selectedBucket);
+    // const uploadPath =
+    //   currentPath.length > 0
+    //     ? `${currentPath.join("/")}/${file.name}`
+    //     : file.name;
+
+    // formData.append("path", uploadPath);
 
     try {
-      const res = await fetch(`${baseURL}/upload`, {
-        method: "POST",
+      const res = await fetch("/api/rabit-mq", {
         headers: {
-          ...getAuthHeader(),
+          Authorization: `Bearer ${token}`,
         },
+        method: "POST",
         body: formData,
       });
 
-      const data = await res.json();
       if (res.ok) {
         setMessage("File uploaded successfully");
-        fetchFiles();
+        setFile(null);
+        const fileInput = document.querySelector(
+          'input[type="file"]'
+        ) as HTMLInputElement;
+        if (fileInput) fileInput.value = "";
       } else {
+        const data = await res.json();
         setMessage(data.error || "Failed to upload file");
       }
     } catch (error) {
-      console.error("Upload error:", error);
+      console.error(error);
       setMessage("Error uploading file");
+    } finally {
+      setIsUploading(false);
+      setTimeout(() => {
+        console.log("calling");
+        fetchFiles();
+      }, 2000);
     }
   };
 
   return (
-    <div className="min-h-screen bg-gray-50 py-8">
-      <div className="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8">
-        <div className="flex justify-between items-center mb-8">
-          <h1 className="text-3xl font-bold text-gray-900">File Manager</h1>
-          <button
-            onClick={() => {
-              window.localStorage.removeItem("jwt_token");
-              window.localStorage.removeItem("refresh_token");
-              signOut({ callbackUrl: "/" });
-            }}
-            className="inline-flex items-center px-4 py-2 border border-transparent text-sm font-medium rounded-md text-white bg-red-600 hover:bg-red-700 focus:outline-none focus:ring-2 focus:ring-offset-2 focus:ring-red-500 transition-colors"
-          >
-            Sign out
-          </button>
-        </div>
-
-        <div className="bg-white rounded-lg shadow-lg p-6 mb-8">
-          <h2 className="text-xl font-semibold mb-4">Upload Files</h2>
-          <div className="space-y-4">
-            <div>
-              <label
-                htmlFor="bucket"
-                className="block text-sm font-medium text-gray-700 mb-1"
-              >
-                Select Bucket
-              </label>
-              <select
-                value={selectedBucket}
-                onChange={(e) => setSelectedBucket(e.target.value)}
-                className="block w-full px-3 py-2 border border-gray-300 rounded-md shadow-sm focus:outline-none focus:ring-blue-500 focus:border-blue-500"
-              >
-                <option value="" className="text-gray-500">
-                  Select a bucket
-                </option>
-                {buckets.map((bucket) => (
-                  <option
-                    key={bucket.name}
-                    value={bucket.name}
-                    className="text-gray-900"
-                  >
-                    {bucket.name}
-                  </option>
-                ))}
-              </select>
-            </div>
-
-            <div>
-              <label className="block text-sm font-medium text-gray-700 mb-1">
-                Choose File
-              </label>
-              <div className="mt-1 flex justify-center px-6 pt-5 pb-6 border-2 border-gray-300 border-dashed rounded-md">
-                <div className="space-y-1 text-center">
-                  <svg
-                    className="mx-auto h-12 w-12 text-gray-400"
-                    stroke="currentColor"
-                    fill="none"
-                    viewBox="0 0 48 48"
-                    aria-hidden="true"
-                  >
-                    <path
-                      d="M28 8H12a4 4 0 00-4 4v20m32-12v8m0 0v8a4 4 0 01-4 4H12a4 4 0 01-4-4v-4m32-4l-3.172-3.172a4 4 0 00-5.656 0L28 28M8 32l9.172-9.172a4 4 0 015.656 0L28 28m0 0l4 4m4-24h8m-4-4v8m-12 4h.02"
-                      strokeWidth={2}
-                      strokeLinecap="round"
-                      strokeLinejoin="round"
-                    />
-                  </svg>
-                  <div className="flex text-sm text-gray-600">
-                    <label
-                      htmlFor="file-upload"
-                      className="relative cursor-pointer bg-white rounded-md font-medium text-blue-600 hover:text-blue-500 focus-within:outline-none focus-within:ring-2 focus-within:ring-offset-2 focus-within:ring-blue-500"
-                    >
-                      <span>Upload a file</span>
-                      <input
-                        id="file-upload"
-                        type="file"
-                        onChange={handleFileChange}
-                        className="sr-only"
-                      />
-                    </label>
-                    <p className="pl-1">or drag and drop</p>
-                  </div>
-                  <p className="text-xs text-gray-500">Any file up to 10MB</p>
-                </div>
-              </div>
-            </div>
-
+    <ProtectedPage>
+      <div className="min-h-screen bg-gray-50 text-black py-10">
+        <div className="max-w-6xl mx-auto bg-white p-8 rounded-lg shadow-sm">
+          <div className="flex justify-between items-center mb-8">
+            <h1 className="text-3xl font-bold text-gray-800">File Manager</h1>
             <button
-              onClick={handleUpload}
-              className="w-full flex justify-center py-2 px-4 border border-transparent rounded-md shadow-sm text-sm font-medium text-white bg-blue-600 hover:bg-blue-700 focus:outline-none focus:ring-2 focus:ring-offset-2 focus:ring-blue-500 transition-colors"
+              onClick={() =>
+                keycloak.logout({ redirectUri: window.location.origin })
+              }
+              className="bg-red-600 text-white px-4 py-2 rounded-lg hover:bg-red-700 transition-colors"
             >
-              Upload File
-            </button>
-
-            {message && (
-              <div className="mt-4 p-4 rounded-md bg-blue-50">
-                <p className="text-sm text-blue-700">{message}</p>
-              </div>
-            )}
-          </div>
-        </div>
-
-        <div className="bg-white rounded-lg shadow-lg p-6">
-          <div className="flex justify-between items-center mb-4">
-            <h2 className="text-xl font-semibold">Files in Selected Bucket</h2>
-            <button
-              onClick={fetchFiles}
-              className="inline-flex items-center px-4 py-2 border border-transparent text-sm font-medium rounded-md text-white bg-blue-600 hover:bg-blue-700 focus:outline-none focus:ring-2 focus:ring-offset-2 focus:ring-blue-500 transition-colors"
-            >
-              Refresh Files
+              Sign Out
             </button>
           </div>
 
-          {files.length === 0 ? (
-            <div className="text-center py-12">
-              <svg
-                className="mx-auto h-12 w-12 text-gray-400"
-                fill="none"
-                viewBox="0 0 24 24"
-                stroke="currentColor"
-                aria-hidden="true"
-              >
-                <path
-                  strokeLinecap="round"
-                  strokeLinejoin="round"
-                  strokeWidth={2}
-                  d="M9 13h6m-3-3v6m-9 1V7a2 2 0 012-2h6l2 2h6a2 2 0 012 2v8a2 2 0 01-2 2H5a2 2 0 01-2-2z"
-                />
-              </svg>
-              <h3 className="mt-2 text-sm font-medium text-gray-900">
-                No files
-              </h3>
-              <p className="mt-1 text-sm text-gray-500">
-                Get started by uploading a new file.
-              </p>
-            </div>
-          ) : (
-            <div className="overflow-x-auto">
-              <table className="min-w-full divide-y divide-gray-200">
-                <thead className="bg-gray-50">
-                  <tr>
-                    <th
-                      scope="col"
-                      className="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider"
-                    >
-                      File Name
-                    </th>
-                    <th
-                      scope="col"
-                      className="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider"
-                    >
-                      URL
-                    </th>
-                  </tr>
-                </thead>
-                <tbody className="bg-white divide-y divide-gray-200">
-                  {files.map((file) => (
-                    <tr key={file.key} className="hover:bg-gray-50">
-                      <td className="px-6 py-4 whitespace-nowrap text-sm font-medium text-gray-900">
-                        {file.key}
-                      </td>
-                      <td className="px-6 py-4 whitespace-nowrap text-sm text-gray-500">
-                        <a
-                          href={file.pathStyleUrl}
-                          target="_blank"
-                          rel="noopener noreferrer"
-                          className="text-blue-600 hover:text-blue-900 break-all"
-                        >
-                          {file.pathStyleUrl}
-                        </a>
-                      </td>
-                    </tr>
+          {/* Upload Section */}
+          <div className="bg-gray-50 p-6 rounded-lg border border-gray-200 mb-8">
+            <h2 className="text-xl font-semibold mb-4 text-gray-800">
+              Upload Files
+            </h2>
+            <div className="space-y-4">
+              <div>
+                <label className="block mb-2 font-medium text-gray-700">
+                  Select Bucket
+                </label>
+                <select
+                  value={selectedBucket}
+                  onChange={(e) => setSelectedBucket(e.target.value)}
+                  className="w-full border border-gray-300 rounded-lg px-4 py-2 focus:ring-2 focus:ring-blue-500 focus:border-blue-500"
+                >
+                  <option value="">-- Choose a bucket --</option>
+                  {buckets.map((b) => (
+                    <option key={b.name} value={b.name}>
+                      {b.name}
+                    </option>
                   ))}
-                </tbody>
-              </table>
+                </select>
+              </div>
+
+              <div>
+                <label className="block mb-2 font-medium text-gray-700">
+                  Choose File
+                </label>
+                <div className="flex items-center space-x-4">
+                  <input
+                    type="file"
+                    multiple
+                    onChange={handleFileChange}
+                    className="block w-full text-sm text-gray-500
+                      file:mr-4 file:py-2 file:px-4
+                      file:rounded-lg file:border-0
+                      file:text-sm file:font-semibold
+                      file:bg-blue-50 file:text-blue-700
+                      hover:file:bg-blue-100"
+                  />
+                  <button
+                    onClick={handleUpload}
+                    disabled={isUploading || !file || !selectedBucket}
+                    className={`px-6 py-2 rounded-lg font-medium transition-colors ${
+                      isUploading || !file || !selectedBucket
+                        ? "bg-gray-300 cursor-not-allowed"
+                        : "bg-blue-600 text-white hover:bg-blue-700"
+                    }`}
+                  >
+                    {isUploading ? "Uploading..." : "Upload"}
+                  </button>
+                </div>
+                {currentPath.length > 0 && (
+                  <p className="mt-2 text-sm text-gray-600">
+                    Uploading to: /{currentPath.join("/")}
+                  </p>
+                )}
+              </div>
+
+              {message && (
+                <div
+                  className={`p-3 rounded-lg ${
+                    message.includes("success")
+                      ? "bg-green-50 text-green-700"
+                      : "bg-red-50 text-red-700"
+                  }`}
+                >
+                  {message}
+                </div>
+              )}
             </div>
-          )}
+          </div>
+
+          {/* File List Section */}
+          <div className="bg-white rounded-lg border border-gray-200">
+            <div className="flex justify-between items-center p-4 border-b border-gray-200">
+              <h2 className="text-xl font-semibold text-gray-800">Files</h2>
+              <button
+                onClick={fetchFiles}
+                className="bg-gray-100 px-4 py-2 rounded-lg hover:bg-gray-200 transition-colors"
+              >
+                Refresh
+              </button>
+            </div>
+
+            <div className="p-4">
+              {renderBreadcrumbs()}
+
+              {tree.length === 0 ? (
+                <p className="text-gray-500 text-center py-8">
+                  No files found.
+                </p>
+              ) : (
+                <div className="bg-white rounded-lg">
+                  {renderCurrentFolder()}
+                </div>
+              )}
+            </div>
+          </div>
         </div>
+
+        {/* Preview Modal */}
+        {previewFile && (
+          <div className="fixed inset-0 bg-black bg-opacity-50 flex items-center justify-center z-50">
+            <div className="bg-white rounded-lg p-6 max-w-4xl w-full mx-4">
+              <div className="flex justify-between items-center mb-4">
+                <h3 className="text-xl font-semibold">{previewFile.name}</h3>
+                <button
+                  onClick={() => setPreviewFile(null)}
+                  className="text-gray-500 hover:text-gray-700"
+                >
+                  ✕
+                </button>
+              </div>
+              <div className="overflow-auto">{renderPreviewContent()}</div>
+            </div>
+          </div>
+        )}
       </div>
-    </div>
+    </ProtectedPage>
   );
 }
